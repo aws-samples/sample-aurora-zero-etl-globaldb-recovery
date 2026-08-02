@@ -1,0 +1,106 @@
+{
+  "Comment": [
+    "Reference copy of the execution role policy that cloudformation/zero-etl-recovery.yaml",
+    "creates. Provided for readers who deploy the function outside CloudFormation.",
+    "Replace 111122223333 with your account ID, REPLACE-WITH-NAMESPACE-UUID with your",
+    "Amazon Redshift namespace, and REPLACE-WITH-KEY-ID with the notification KMS key.",
+    "The Region is deliberately left as * in the RDS statements: the stale integration",
+    "lives in the former primary's Region, so cleanup crosses Region boundaries."
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiscoverGlobalClusterAndIntegrations",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeGlobalClusters",
+        "rds:DescribeIntegrations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageIntegration",
+      "Effect": "Allow",
+      "Action": [
+        "rds:CreateIntegration",
+        "rds:DeleteIntegration"
+      ],
+      "Resource": [
+        "arn:aws:rds:*:111122223333:cluster:*",
+        "arn:aws:rds:*:111122223333:integration:*"
+      ]
+    },
+    {
+      "Sid": "TagIntegration",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddTagsToResource",
+        "rds:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:rds:*:111122223333:integration:*"
+    },
+    {
+      "Sid": "AuthorizeRedshiftInboundIntegration",
+      "Effect": "Allow",
+      "Action": [
+        "redshift:CreateInboundIntegration",
+        "redshift:DeleteInboundIntegration",
+        "redshift-serverless:CreateInboundIntegration"
+      ],
+      "Resource": "arn:aws:redshift-serverless:us-east-1:111122223333:namespace/REPLACE-WITH-NAMESPACE-UUID"
+    },
+    {
+      "Sid": "PublishNotifications",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:*:111122223333:globaldb-analytics-zero-etl-recovery"
+    },
+    {
+      "Sid": "SendToDeadLetterQueue",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:*:111122223333:globaldb-analytics-zero-etl-recovery-dlq"
+    },
+    {
+      "Sid": "UseNotificationKeyViaMessaging",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:*:111122223333:key/REPLACE-WITH-KEY-ID",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": [
+            "sns.us-east-1.amazonaws.com",
+            "sqs.us-east-1.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DecryptEnvironmentVariables",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:*:111122223333:key/REPLACE-WITH-KEY-ID"
+    },
+    {
+      "Sid": "WriteOwnLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:111122223333:log-group:/aws/lambda/globaldb-analytics-zero-etl-recovery:*"
+    },
+    {
+      "Sid": "TraceWithXRay",
+      "Effect": "Allow",
+      "Action": [
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

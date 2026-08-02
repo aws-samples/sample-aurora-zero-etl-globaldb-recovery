@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaged CloudFormation output
+.packaged.yaml
+packaged.yaml
+*.zip
+
+# Local scan and build output
+checkov-report.*
+build/
+dist/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+~$*

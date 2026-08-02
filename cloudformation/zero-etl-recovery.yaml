@@ -1,0 +1,745 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Recreates an Aurora zero-ETL integration with Amazon Redshift after an Aurora
+  Global Database switchover or failover. Deploy this stack in every AWS Region
+  that can host the primary DB cluster of the global database.
+
+Metadata:
+  LambdaSource:
+    Note: >
+      The RecoveryFunction Code.ZipFile block is generated from
+      lambda/zero_etl_recovery.py. Do not edit it by hand. Run
+      python3 scripts/sync_lambda_into_template.py --write to regenerate, and
+      --check to verify that the template and the source file agree.
+
+Parameters:
+  GlobalClusterId:
+    Type: String
+    MinLength: 1
+    Description: >
+      Aurora global cluster identifier, for example aurora-postgres-global.
+  TargetArn:
+    Type: String
+    MinLength: 1
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:redshift(-serverless)?:.*$'
+    Description: >
+      Amazon Redshift target namespace ARN. Provisioned clusters use
+      arn:aws:redshift:<region>:<account>:namespace:<uuid>. Redshift Serverless
+      uses arn:aws:redshift-serverless:<region>:<account>:namespace/<uuid>.
+  IntegrationName:
+    Type: String
+    Default: globaldb-analytics
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    Description: Name applied to the managed zero-ETL integration.
+  DataFilter:
+    Type: String
+    Default: ''
+    Description: >
+      Data filter expression. Required for Aurora PostgreSQL sources, which use
+      database.schema.table patterns, for example "include: salesdb.*.*".
+      Aurora MySQL uses database.table patterns.
+  KmsKeyId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional customer managed AWS KMS key ID for the integration. The key must
+      be usable in every Region that can host the primary.
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email address subscribed to the notification topic. Confirm the
+      subscription from your inbox after the stack completes.
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: Retention period for the function's CloudWatch log group.
+
+Conditions:
+  HasDataFilter: !Not [!Equals [!Ref DataFilter, '']]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyId, '']]
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+
+  # Customer managed key so that the notification topic and the dead-letter
+  # queue are encrypted with a key whose policy this account controls.
+  NotificationKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Encrypts zero-ETL recovery notifications for ${IntegrationName}.'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchAndEventsToUseTopic
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          # CloudWatch Logs is a service principal, so it must be granted in the
+          # key policy directly. The log group ARN is built from the name pattern
+          # rather than !GetAtt to avoid a circular dependency with the key.
+          - Sid: AllowCloudWatchLogsToUseKey
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${IntegrationName}-zero-etl-recovery'
+
+  NotificationKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${IntegrationName}-zero-etl-recovery'
+      TargetKeyId: !Ref NotificationKey
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${IntegrationName}-zero-etl-recovery'
+      KmsMasterKeyId: !Ref NotificationKey
+
+  # Enforce TLS for every publish to the topic.
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOwnerPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'sns:Publish'
+            Resource: !Ref NotificationTopic
+          - Sid: AllowServicePublish
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref NotificationTopic
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref NotificationTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Captures invocations that still fail after EventBridge exhausts its retries,
+  # so a failed recovery is never lost silently.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${IntegrationName}-zero-etl-recovery-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref NotificationKey
+      SqsManagedSseEnabled: false
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IntegrationName}-zero-etl-recovery'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !GetAtt NotificationKey.Arn
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IntegrationName}-zero-etl-recovery'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !GetAtt NotificationKey.Arn
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: zero-etl-recovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DescribeGlobalClusters and DescribeIntegrations do not support
+              # resource-level permissions, so they are scoped by action only.
+              - Sid: DiscoverGlobalClusterAndIntegrations
+                Effect: Allow
+                Action:
+                  - rds:DescribeGlobalClusters
+                  - rds:DescribeIntegrations
+                Resource: '*'
+              # Every Region is in scope: the stale integration lives in the
+              # former primary's Region, not this one.
+              - Sid: ManageIntegration
+                Effect: Allow
+                Action:
+                  - rds:CreateIntegration
+                  - rds:DeleteIntegration
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:cluster:*'
+                  - !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:integration:*'
+              - Sid: TagIntegration
+                Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                  - rds:ListTagsForResource
+                Resource: !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:integration:*'
+              - Sid: AuthorizeRedshiftInboundIntegration
+                Effect: Allow
+                Action:
+                  - redshift:CreateInboundIntegration
+                  - redshift:DeleteInboundIntegration
+                  - redshift-serverless:CreateInboundIntegration
+                Resource: !Ref TargetArn
+              - !If
+                - HasKmsKey
+                - Sid: UseIntegrationKmsKey
+                  Effect: Allow
+                  Action:
+                    - kms:CreateGrant
+                    - kms:DescribeKey
+                  Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/${KmsKeyId}'
+                - !Ref AWS::NoValue
+              - Sid: PublishNotifications
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Sid: UseNotificationKeyViaMessaging
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt NotificationKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService':
+                      - !Sub 'sns.${AWS::Region}.amazonaws.com'
+                      - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+              # Lambda decrypts the environment variables during initialization,
+              # which is not a ViaService call, so it needs its own statement.
+              - Sid: DecryptEnvironmentVariables
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt NotificationKey.Arn
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${LogGroup.Arn}:*'
+              - Sid: SendToDeadLetterQueue
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  RecoveryFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_117: The function calls only public AWS API endpoints and needs no VPC attachment.
+    # checkov:skip=CKV_AWS_272: Code signing is out of scope for a single-file inline sample.
+    Properties:
+      FunctionName: !Sub '${IntegrationName}-zero-etl-recovery'
+      Runtime: python3.13
+      # Inline code is placed in a file named index, so the handler must be
+      # index.handler.
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 2
+      Role: !GetAtt FunctionRole.Arn
+      # Encrypts the environment variables at rest with the customer managed key.
+      KmsKeyArn: !GetAtt NotificationKey.Arn
+      TracingConfig:
+        Mode: Active
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          GLOBAL_CLUSTER_ID: !Ref GlobalClusterId
+          TARGET_ARN: !Ref TargetArn
+          INTEGRATION_NAME: !Ref IntegrationName
+          DATA_FILTER: !If [HasDataFilter, !Ref DataFilter, !Ref 'AWS::NoValue']
+          KMS_KEY_ID: !If [HasKmsKey, !Ref KmsKeyId, !Ref 'AWS::NoValue']
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          # GENERATED FROM lambda/zero_etl_recovery.py - DO NOT EDIT
+          """Recreate an Aurora zero-ETL integration after a Global Database transition.
+
+          Amazon EventBridge invokes this function when an Aurora global database finishes
+          a switchover (RDS-EVENT-0185) or a failover (RDS-EVENT-0238, RDS-EVENT-0519).
+          The function reconciles the zero-ETL integration so that it points at whichever
+          DB cluster is currently the writer of the global cluster.
+
+          Design notes
+          ------------
+          1. The global cluster is the source of truth, not the event. The function calls
+             DescribeGlobalClusters and reads which member reports IsWriter, instead of
+             trusting a single event payload. Duplicate, retried, or out-of-order events
+             therefore converge on the same result.
+
+          2. Region affinity picks a single actor. CreateIntegration is a Regional call
+             and the integration is created in the Region of the source cluster. Deploy
+             this function in every Region that can host the primary. Each copy acts only
+             when the current writer is in its own Region and exits otherwise, so exactly
+             one Region performs the recreate without any locking.
+
+          3. Stale cleanup is cross-Region. The integration bound to the former primary
+             lives in the former primary's Region, so a Regional DescribeIntegrations
+             call in the new primary's Region cannot see it. The function walks every
+             member Region of the global cluster with a Regional client to find and delete
+             integrations it owns. Deletion is best effort: during a real Regional outage
+             the former primary's Region may be unreachable, and the new integration must
+             still be created.
+
+          4. Ownership is tag-scoped. The function only ever deletes integrations that
+             carry both of its own tags, so integrations managed elsewhere are untouched.
+
+          Environment variables
+          ---------------------
+          GLOBAL_CLUSTER_ID  (required) Aurora global cluster identifier.
+          TARGET_ARN         (required) Amazon Redshift namespace ARN (provisioned or
+                             Serverless) that receives the replicated data.
+          INTEGRATION_NAME   (required) Name applied to the managed integration.
+          DATA_FILTER        (optional) Data filter expression. Required for Aurora
+                             PostgreSQL sources, for example "include: salesdb.*.*".
+          KMS_KEY_ID         (optional) Customer managed AWS KMS key for the integration.
+          SNS_TOPIC_ARN      (optional) Topic that receives outcome notifications.
+          """
+
+          import json
+          import logging
+          import os
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          GLOBAL_CLUSTER_ID = os.environ["GLOBAL_CLUSTER_ID"]
+          TARGET_ARN = os.environ["TARGET_ARN"]
+          INTEGRATION_NAME = os.environ["INTEGRATION_NAME"]
+          DATA_FILTER = os.environ.get("DATA_FILTER")
+          KMS_KEY_ID = os.environ.get("KMS_KEY_ID")
+          SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+
+          # Lambda populates AWS_REGION with the Region the function runs in.
+          THIS_REGION = os.environ["AWS_REGION"]
+
+          # Tag values that mark an integration as owned by this automation.
+          MANAGED_BY_TAG = "ManagedBy"
+          MANAGED_BY_VALUE = "zero-etl-globaldb-recovery"
+          GLOBAL_CLUSTER_TAG = "GlobalCluster"
+
+          # Integration states that mean "an integration already exists here, do not
+          # create a second one".
+          LIVE_STATES = frozenset(
+              {"creating", "active", "modifying", "syncing", "needs_attention"}
+          )
+
+          _BOTO_CONFIG = Config(
+              retries={"max_attempts": 5, "mode": "standard"},
+              connect_timeout=5,
+              read_timeout=20,
+          )
+
+          rds = boto3.client("rds", config=_BOTO_CONFIG)
+          sns = boto3.client("sns", config=_BOTO_CONFIG) if SNS_TOPIC_ARN else None
+
+          _regional_rds = {THIS_REGION: rds}
+
+
+          def _rds_for(region):
+              """Return an RDS client bound to region, creating it on first use."""
+              if region not in _regional_rds:
+                  _regional_rds[region] = boto3.client(
+                      "rds", region_name=region, config=_BOTO_CONFIG
+                  )
+              return _regional_rds[region]
+
+
+          def _region_of(arn):
+              return arn.split(":")[3]
+
+
+          def _notify(subject, message):
+              logger.info("%s | %s", subject, message)
+              if not sns:
+                  return
+              try:
+                  sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
+              except (ClientError, BotoCoreError) as exc:
+                  # A failed notification must not mask the recovery result.
+                  logger.warning("Could not publish notification: %s", exc)
+
+
+          def _global_members():
+              """Return the member list of the global cluster."""
+              response = rds.describe_global_clusters(
+                  GlobalClusterIdentifier=GLOBAL_CLUSTER_ID
+              )
+              return response["GlobalClusters"][0]["GlobalClusterMembers"]
+
+
+          def _writer_arn(members):
+              """Return the DB cluster ARN of the current writer, or None."""
+              for member in members:
+                  if member.get("IsWriter"):
+                      return member["DBClusterArn"]
+              return None
+
+
+          def _managed_integrations(region):
+              """Return integrations in region that this automation owns."""
+              owned = []
+              client = _rds_for(region)
+              for page in client.get_paginator("describe_integrations").paginate():
+                  for integration in page["Integrations"]:
+                      if integration.get("TargetArn") != TARGET_ARN:
+                          continue
+                      tags = {t["Key"]: t["Value"] for t in integration.get("Tags", [])}
+                      if (
+                          tags.get(MANAGED_BY_TAG) == MANAGED_BY_VALUE
+                          and tags.get(GLOBAL_CLUSTER_TAG) == GLOBAL_CLUSTER_ID
+                      ):
+                          owned.append(integration)
+              return owned
+
+
+          def _delete_stale(regions, keep_source_arn):
+              """Delete owned integrations that do not point at keep_source_arn.
+
+              Walks every member Region because the stale integration lives in the former
+              primary's Region. Returns (deleted_arns, unreachable_regions). Failures are
+              reported rather than raised so that recovery proceeds when a Region is
+              unavailable.
+              """
+              deleted = []
+              unreachable = []
+
+              for region in regions:
+                  try:
+                      candidates = _managed_integrations(region)
+                  except (ClientError, BotoCoreError) as exc:
+                      logger.warning("Could not list integrations in %s: %s", region, exc)
+                      unreachable.append(region)
+                      continue
+
+                  for integration in candidates:
+                      if integration["SourceArn"] == keep_source_arn:
+                          continue
+                      if integration["Status"] == "deleting":
+                          continue
+                      arn = integration["IntegrationArn"]
+                      logger.info(
+                          "Deleting stale integration %s in %s (source %s, status %s)",
+                          arn,
+                          region,
+                          integration["SourceArn"],
+                          integration["Status"],
+                      )
+                      try:
+                          _rds_for(region).delete_integration(IntegrationIdentifier=arn)
+                          deleted.append(arn)
+                      except (ClientError, BotoCoreError) as exc:
+                          logger.warning("Could not delete %s in %s: %s", arn, region, exc)
+                          unreachable.append(region)
+
+              return deleted, unreachable
+
+
+          def _live_integration_for(integrations, source_arn):
+              for integration in integrations:
+                  if (
+                      integration["SourceArn"] == source_arn
+                      and integration["Status"] in LIVE_STATES
+                  ):
+                      return integration
+              return None
+
+
+          def _create_integration(source_arn):
+              kwargs = {
+                  "SourceArn": source_arn,
+                  "TargetArn": TARGET_ARN,
+                  "IntegrationName": INTEGRATION_NAME,
+                  "Tags": [
+                      {"Key": MANAGED_BY_TAG, "Value": MANAGED_BY_VALUE},
+                      {"Key": GLOBAL_CLUSTER_TAG, "Value": GLOBAL_CLUSTER_ID},
+                  ],
+              }
+              # Aurora PostgreSQL sources require at least one data filter pattern.
+              if DATA_FILTER:
+                  kwargs["DataFilter"] = DATA_FILTER
+              if KMS_KEY_ID:
+                  kwargs["KMSKeyId"] = KMS_KEY_ID
+              return rds.create_integration(**kwargs)
+
+
+          def handler(event, _context):
+              logger.info("Received event: %s", json.dumps(event))
+              event_id = event.get("detail", {}).get("EventID", "unknown")
+
+              members = _global_members()
+              writer_arn = _writer_arn(members)
+              if not writer_arn:
+                  # A transition can be mid-flight. A later event, or the EventBridge
+                  # retry, reconciles once a writer is elected.
+                  logger.info("No writer yet for %s. Exiting.", GLOBAL_CLUSTER_ID)
+                  return {"status": "skipped", "reason": "no-writer"}
+
+              if _region_of(writer_arn) != THIS_REGION:
+                  logger.info(
+                      "Writer is in %s, this function runs in %s. Exiting.",
+                      _region_of(writer_arn),
+                      THIS_REGION,
+                  )
+                  return {"status": "skipped", "reason": "not-writer-region"}
+
+              member_regions = sorted(
+                  {_region_of(m["DBClusterArn"]) for m in members} | {THIS_REGION}
+              )
+
+              local = _managed_integrations(THIS_REGION)
+              existing = _live_integration_for(local, writer_arn)
+
+              deleted, unreachable = _delete_stale(member_regions, keep_source_arn=writer_arn)
+
+              if existing:
+                  logger.info(
+                      "Integration %s already targets the writer (status %s).",
+                      existing["IntegrationArn"],
+                      existing["Status"],
+                  )
+                  return {
+                      "status": "noop",
+                      "integrationArn": existing["IntegrationArn"],
+                      "staleDeleted": deleted,
+                      "unreachableRegions": unreachable,
+                  }
+
+              try:
+                  result = _create_integration(writer_arn)
+              except rds.exceptions.IntegrationAlreadyExistsFault:
+                  logger.info("Integration already exists for this source and target.")
+                  return {"status": "exists", "staleDeleted": deleted}
+              except rds.exceptions.IntegrationConflictOperationFault as exc:
+                  # Usually a delete that has not finished. Raise so EventBridge retries.
+                  _notify(
+                      "Zero-ETL recovery deferred",
+                      f"Conflict recreating the integration for {GLOBAL_CLUSTER_ID}: {exc}. "
+                      "EventBridge retries this invocation.",
+                  )
+                  raise
+              except rds.exceptions.IntegrationQuotaExceededFault as exc:
+                  _notify(
+                      "Zero-ETL recovery failed: quota exceeded",
+                      f"Reached an integration quota while recovering {GLOBAL_CLUSTER_ID}: "
+                      f"{exc}. Stale integrations may still exist in {unreachable or 'another Region'}. "
+                      "Review integration quotas for the source cluster, target, and account.",
+                  )
+                  raise
+              except rds.exceptions.KMSKeyNotAccessibleFault as exc:
+                  _notify(
+                      "Zero-ETL recovery failed: KMS key not accessible",
+                      f"The KMS key for {GLOBAL_CLUSTER_ID} is not usable in {THIS_REGION}: "
+                      f"{exc}. A customer managed key must be usable in every Region that "
+                      "can host the primary.",
+                  )
+                  raise
+
+              summary = [
+                  f"Event {event_id} on global cluster {GLOBAL_CLUSTER_ID}.",
+                  f"Created integration {result['IntegrationArn']} against the new primary "
+                  f"{writer_arn}.",
+                  "Initial data seeding runs before the target is queryable again.",
+              ]
+              if deleted:
+                  summary.append(f"Deleted stale integrations: {', '.join(deleted)}.")
+              if unreachable:
+                  summary.append(
+                      "Could not confirm cleanup in: "
+                      f"{', '.join(sorted(set(unreachable)))}. Check for a leftover "
+                      "integration once those Regions recover."
+                  )
+
+              _notify("Zero-ETL integration recreated", " ".join(summary))
+
+              return {
+                  "status": "created",
+                  "integrationArn": result["IntegrationArn"],
+                  "sourceArn": writer_arn,
+                  "staleDeleted": deleted,
+                  "unreachableRegions": sorted(set(unreachable)),
+              }
+    DependsOn:
+      - LogGroup
+
+  XRayPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: zero-etl-recovery-xray
+      Roles:
+        - !Ref FunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: '*'
+
+  # Matches on EventID only. The RDS event category for these events is
+  # "global failover" with a space, which is easy to mistype; EventID values are
+  # unique, so matching on them alone is both precise and robust.
+  GlobalFailoverRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${IntegrationName}-globaldb-failover'
+      Description: >
+        Aurora Global Database switchover-finished and failover-completed events.
+      EventPattern:
+        source:
+          - aws.rds
+        detail-type:
+          - RDS DB Cluster Event
+        detail:
+          EventID:
+            # Global switchover finished.
+            - RDS-EVENT-0185
+            # Global failover completed.
+            - RDS-EVENT-0238
+            # Global failover completed, promoted cluster has no instances.
+            - RDS-EVENT-0519
+      State: ENABLED
+      Targets:
+        - Id: recovery-function
+          Arn: !GetAtt RecoveryFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 4
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  RulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RecoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GlobalFailoverRule.Arn
+
+  # Alarms if the recovery function itself fails. This is the signal that needs
+  # a human: the integration was not recreated.
+  RecoveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${IntegrationName}-zero-etl-recovery-failed'
+      AlarmDescription: >
+        The zero-ETL recovery function raised an error, so the integration may
+        still point at the former primary cluster.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecoveryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # Alarms if a failed invocation lands in the dead-letter queue.
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${IntegrationName}-zero-etl-recovery-dlq-not-empty'
+      AlarmDescription: >
+        A recovery invocation exhausted its retries. Inspect the dead-letter
+        queue and reconcile the integration manually.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the recovery function.
+    Value: !GetAtt RecoveryFunction.Arn
+  FunctionRoleArn:
+    Description: ARN of the function's execution role.
+    Value: !GetAtt FunctionRole.Arn
+  NotificationTopicArn:
+    Description: SNS topic that receives recovery notifications and alarms.
+    Value: !Ref NotificationTopic
+  DeadLetterQueueUrl:
+    Description: Dead-letter queue for invocations that exhausted their retries.
+    Value: !Ref DeadLetterQueue
+  EventRuleArn:
+    Description: EventBridge rule that matches Global Database transition events.
+    Value: !GetAtt GlobalFailoverRule.Arn
