@@ -1,8 +1,4 @@
-# Automate Aurora zero-ETL recovery after global failover
-
-> **Internal staging copy.** This repository is staged on gitlab.aws.dev for
-> security scanning and internal review. Remove this note before pushing to
-> `aws-samples`.
+# Automating Aurora zero-ETL recovery after global failover
 
 Event-driven automation that recreates an Amazon Aurora zero-ETL integration
 with Amazon Redshift after an Amazon Aurora Global Database switchover or
@@ -12,22 +8,19 @@ This is sample code, for non-production usage. You should work with your
 security and legal teams to meet your organizational security, regulatory and
 compliance requirements before deployment.
 
-## The problem
+## How the recovery works
 
-A zero-ETL integration is bound to a specific source DB cluster ARN. In an
-Aurora global database, each Region has its own DB cluster with its own ARN, so
-a switchover or failover promotes a *different* cluster to primary. The
-integration still references the former primary, replication into Amazon
-Redshift stops, and the integration becomes inactive.
-
-Aurora has no in-place refresh for this. The documented recovery is to delete
-the integration and create a new one against the new primary. Until someone
-does that, applications keep writing to Aurora through the global writer
-endpoint while the data in Amazon Redshift silently stops advancing.
+A zero-ETL integration identifies its source by the ARN of one DB cluster, and
+each cluster in a global database has its own ARN. A switchover or failover
+promotes a cluster with a different ARN to primary, so the integration stops
+replicating. The documented recovery is to delete the integration and create a
+new one against the new primary. This automation performs that recovery for
+you: it detects the Aurora Global Database transition event and recreates the
+zero-ETL integration against the new primary.
 
 ## What this deploys
 
-![Architecture diagram: an Aurora global database switchover or failover emits an RDS event; an EventBridge rule in each Region invokes a Lambda function; the function queries the global cluster for the current writer, deletes the stale integration in the former primary's Region, and creates a new zero-ETL integration against the new primary; SNS notifies operators and CloudWatch alarms cover function errors and the dead-letter queue.](docs/architecture-zero-etl-recovery.png)
+![Architecture diagram: an Aurora global database switchover or failover emits an RDS event; an EventBridge rule in each Region invokes a Lambda function; the function queries the global cluster for the current writer, deletes the previous integration in the former primary's Region, and creates a new zero-ETL integration against the new primary; SNS notifies operators and CloudWatch alarms cover function errors and the dead-letter queue.](docs/architecture-zero-etl-recovery.png)
 
 1. Aurora emits `RDS-EVENT-0185` (global switchover finished),
    `RDS-EVENT-0238` (global failover completed), or `RDS-EVENT-0519` (global
@@ -39,8 +32,8 @@ endpoint while the data in Amazon Redshift silently stops advancing.
    out-of-order events converge on the same result.
 4. The function acts only if the writer is in its own Region, so exactly one
    Region performs the recreate without any locking.
-5. It deletes the stale integration it owns — searching **every** member Region,
-   because the stale integration lives in the former primary's Region — then
+5. It deletes the previous integration it owns, searching every member Region
+   because that integration lives in the former primary's Region, and then
    creates a new integration against the new primary.
 6. Amazon SNS reports the outcome. Amazon CloudWatch alarms cover function
    errors and a non-empty dead-letter queue.
@@ -172,7 +165,7 @@ Switch back to validate the reverse direction.
   pipeline promptly; data continuity in Amazon Redshift follows after the
   reseed. Prefer planned switchovers so you can schedule that window.
 - **Cleanup is best effort during a Regional outage.** If the former primary's
-  Region is unreachable, the stale integration cannot be deleted. The function
+  Region is unreachable, the previous integration cannot be deleted. The function
   still creates the new integration and reports the Regions it could not reach
   in its SNS notification and return value. Reconcile once those Regions
   recover.
