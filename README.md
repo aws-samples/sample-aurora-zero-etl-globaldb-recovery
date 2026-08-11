@@ -164,11 +164,11 @@ Switch back to validate the reverse direction.
   source before the target is fully queryable again. The automation restores the
   pipeline promptly; data continuity in Amazon Redshift follows after the
   reseed. Prefer planned switchovers so you can schedule that window.
-- **Cleanup is best effort during a Regional outage.** If the former primary's
-  Region is unreachable, the previous integration cannot be deleted. The function
-  still creates the new integration and reports the Regions it could not reach
-  in its SNS notification and return value. Reconcile once those Regions
-  recover.
+- **Cleanup is best effort during a service impairment.** If API calls to the
+  former primary's Region do not succeed, the previous integration cannot be
+  deleted. The function still creates the new integration and reports the
+  Regions it could not reach in its SNS notification and return value.
+  Reconcile once access is restored.
 - **Tag-scoped ownership.** The function only deletes integrations carrying both
   its `ManagedBy` and `GlobalCluster` tags. Integrations managed elsewhere are
   never touched. Conversely, an integration created by hand will not be cleaned

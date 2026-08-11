@@ -338,9 +338,9 @@ Resources:
              lives in the former primary's Region, so a Regional DescribeIntegrations
              call in the new primary's Region cannot see it. The function walks every
              member Region of the global cluster with a Regional client to find and delete
-             integrations it owns. Deletion is best effort: during a real Regional outage
-             the former primary's Region may be unreachable, and the new integration must
-             still be created.
+             integrations it owns. Deletion is best effort: during a service impairment
+             API calls to the former primary's Region may not succeed, and the new
+             integration must still be created.
 
           4. Ownership is tag-scoped. The function only ever deletes integrations that
              carry both of its own tags, so integrations managed elsewhere are untouched.
