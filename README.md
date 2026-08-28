@@ -10,6 +10,8 @@ compliance requirements before deployment.
 
 ## Architecture constraint: one Redshift target per Region
 
+![Architecture diagram showing an Aurora Global Database across two Regions. EventBridge invokes a Lambda recovery function after switchover or failover. The function recreates the zero-ETL integration against the active logical Amazon Redshift target, while Amazon CloudWatch and Amazon SNS report health and failures. Each deployed source uses a Redshift target in the same Region.](docs/architecture-zero-etl-recovery.png)
+
 Amazon Redshift requires a zero-ETL target to be in the same AWS Region as the
 integration source. Provide a Redshift namespace in every Region that can host
 the Aurora primary. Each regional stack receives its local namespace ARN. After
