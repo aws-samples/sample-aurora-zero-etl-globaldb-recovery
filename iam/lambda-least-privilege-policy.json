@@ -1,46 +1,83 @@
 {
   "Comment": [
-    "Reference copy of the execution role policy that cloudformation/zero-etl-recovery.yaml",
-    "creates. Provided for readers who deploy the function outside CloudFormation.",
-    "Replace 111122223333 with your account ID, REPLACE-WITH-NAMESPACE-UUID with your",
-    "Amazon Redshift namespace, and REPLACE-WITH-KEY-ID with the notification KMS key.",
-    "The Region is deliberately left as * in the RDS statements: the stale integration",
-    "lives in the former primary's Region, so cleanup crosses Region boundaries."
+    "Reference copy of the execution role policy created by cloudformation/zero-etl-recovery.yaml.",
+    "Replace account, Region, cluster, namespace, global cluster, and KMS placeholders.",
+    "Describe actions and X-Ray writes require Resource '*'. Integration ARNs retain a Region wildcard because cleanup spans every member Region, but creation and deletion are constrained by source ARNs and ownership tags."
   ],
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "DiscoverGlobalClusterAndIntegrations",
+      "Sid": "DiscoverTopologyAndIntegrations",
       "Effect": "Allow",
       "Action": [
         "rds:DescribeGlobalClusters",
+        "rds:DescribeDBClusters",
         "rds:DescribeIntegrations"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "ManageIntegration",
+      "Sid": "CreateIntegrationForConfiguredSources",
       "Effect": "Allow",
-      "Action": [
-        "rds:CreateIntegration",
-        "rds:DeleteIntegration"
-      ],
+      "Action": "rds:CreateIntegration",
       "Resource": [
-        "arn:aws:rds:*:111122223333:cluster:*",
-        "arn:aws:rds:*:111122223333:integration:*"
-      ]
-    },
-    {
-      "Sid": "TagIntegration",
-      "Effect": "Allow",
-      "Action": [
-        "rds:AddTagsToResource",
-        "rds:ListTagsForResource"
+        "arn:aws:rds:us-east-1:111122223333:cluster:aurora-postgres-primary",
+        "arn:aws:rds:us-west-2:111122223333:cluster:aurora-postgres-secondary"
       ],
-      "Resource": "arn:aws:rds:*:111122223333:integration:*"
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "zero-etl-globaldb-recovery",
+          "aws:RequestTag/GlobalCluster": "aurora-postgres-global"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": ["ManagedBy", "GlobalCluster"]
+        }
+      }
     },
     {
-      "Sid": "AuthorizeRedshiftInboundIntegration",
+      "Sid": "CreateOwnedIntegrationResource",
+      "Effect": "Allow",
+      "Action": "rds:CreateIntegration",
+      "Resource": "arn:aws:rds:*:111122223333:integration:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "zero-etl-globaldb-recovery",
+          "aws:RequestTag/GlobalCluster": "aurora-postgres-global"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": ["ManagedBy", "GlobalCluster"]
+        }
+      }
+    },
+    {
+      "Sid": "DeleteOwnedIntegrations",
+      "Effect": "Allow",
+      "Action": "rds:DeleteIntegration",
+      "Resource": "arn:aws:rds:*:111122223333:integration:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ManagedBy": "zero-etl-globaldb-recovery",
+          "aws:ResourceTag/GlobalCluster": "aurora-postgres-global"
+        }
+      }
+    },
+    {
+      "Sid": "TagIntegrationOnCreate",
+      "Effect": "Allow",
+      "Action": "rds:AddTagsToResource",
+      "Resource": "arn:aws:rds:*:111122223333:integration:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "zero-etl-globaldb-recovery",
+          "aws:RequestTag/GlobalCluster": "aurora-postgres-global"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": ["ManagedBy", "GlobalCluster"]
+        }
+      }
+    },
+    {
+      "Sid": "AuthorizeLocalRedshiftInboundIntegration",
       "Effect": "Allow",
       "Action": [
         "redshift:CreateInboundIntegration",
@@ -50,25 +87,28 @@
       "Resource": "arn:aws:redshift-serverless:us-east-1:111122223333:namespace/REPLACE-WITH-NAMESPACE-UUID"
     },
     {
+      "Sid": "UseLocalIntegrationKmsKey",
+      "Effect": "Allow",
+      "Action": ["kms:CreateGrant", "kms:DescribeKey"],
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-KEY-ID"
+    },
+    {
       "Sid": "PublishNotifications",
       "Effect": "Allow",
       "Action": "sns:Publish",
-      "Resource": "arn:aws:sns:*:111122223333:globaldb-analytics-zero-etl-recovery"
+      "Resource": "arn:aws:sns:us-east-1:111122223333:globaldb-analytics-zero-etl-recovery"
     },
     {
       "Sid": "SendToDeadLetterQueue",
       "Effect": "Allow",
       "Action": "sqs:SendMessage",
-      "Resource": "arn:aws:sqs:*:111122223333:globaldb-analytics-zero-etl-recovery-dlq"
+      "Resource": "arn:aws:sqs:us-east-1:111122223333:globaldb-analytics-zero-etl-recovery-dlq"
     },
     {
       "Sid": "UseNotificationKeyViaMessaging",
       "Effect": "Allow",
-      "Action": [
-        "kms:Decrypt",
-        "kms:GenerateDataKey"
-      ],
-      "Resource": "arn:aws:kms:*:111122223333:key/REPLACE-WITH-KEY-ID",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-NOTIFICATION-KEY-ID",
       "Condition": {
         "StringEquals": {
           "kms:ViaService": [
@@ -82,24 +122,18 @@
       "Sid": "DecryptEnvironmentVariables",
       "Effect": "Allow",
       "Action": "kms:Decrypt",
-      "Resource": "arn:aws:kms:*:111122223333:key/REPLACE-WITH-KEY-ID"
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-NOTIFICATION-KEY-ID"
     },
     {
       "Sid": "WriteOwnLogs",
       "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Resource": "arn:aws:logs:*:111122223333:log-group:/aws/lambda/globaldb-analytics-zero-etl-recovery:*"
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/globaldb-analytics-zero-etl-recovery:*"
     },
     {
       "Sid": "TraceWithXRay",
       "Effect": "Allow",
-      "Action": [
-        "xray:PutTraceSegments",
-        "xray:PutTelemetryRecords"
-      ],
+      "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
       "Resource": "*"
     }
   ]
