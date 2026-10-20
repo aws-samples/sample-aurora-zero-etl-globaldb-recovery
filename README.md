@@ -1,4 +1,4 @@
-# Automating Aurora zero-ETL recovery after global failover
+# Automate Aurora zero-ETL recovery after global failover
 
 Event-driven automation that recreates an Amazon Aurora zero-ETL integration
 with a same-Region Amazon Redshift target after an Amazon Aurora Global Database
@@ -33,19 +33,27 @@ route queries.
    is available with a writer DB instance.
 5. The function finds old integrations by ownership tags across all member
    Regions, deletes them, and creates an integration against the local target.
-6. Lambda retries handler errors twice. If retries expire, the event reaches the
-   dead-letter queue and alarms notify operators. EventBridge separately retries
-   failures to deliver the event to Lambda.
+6. The function creates or updates two replication alarms for the new
+   integration ID and sends an SNS notification that includes that ID.
+7. An operator creates the Redshift destination database from the new
+   integration ID. The sample doesn't automate this step.
+8. If the handler raises an error, Lambda retries it as configured by the
+   template. If retries expire, the event reaches the dead-letter queue and
+   alarms notify operators.
 
-For event `RDS-EVENT-0519`, the readiness check fails before cleanup. Create a
-writer DB instance, then replay the dead-letter event or invoke the function
-again. The automation does not poll indefinitely for an instance.
+For event `RDS-EVENT-0519`, the readiness check fails before cleanup. The
+template's retry budget is short (Lambda waits one minute, then two minutes,
+between attempts), so plan to create a writer DB instance and then replay the
+dead-letter event or invoke the function again. For this event, the replay is
+the expected recovery path. The automation does not poll indefinitely for an
+instance.
 
 ## Repository layout
 
 | Path | Description |
 |---|---|
 | `cloudformation/zero-etl-recovery.yaml` | KMS, SNS, SQS DLQ, IAM, Lambda, EventBridge, alarms, and log group. |
+| `.github/workflows/validate.yml` | CI checks: compile, inline-code sync, IAM JSON, and Checkov. |
 | `lambda/zero_etl_recovery.py` | Canonical recovery function source. |
 | `scripts/sync_lambda_into_template.py` | Keeps inline Lambda code identical to the canonical source. |
 | `iam/lambda-least-privilege-policy.json` | Reference execution-role policy. |
@@ -53,8 +61,10 @@ again. The automation does not poll indefinitely for an instance.
 
 ## Prerequisites
 
-1. An Aurora PostgreSQL global database whose member clusters run supported
-   zero-ETL engine versions.
+1. An Aurora PostgreSQL global database. Zero-ETL requires Aurora PostgreSQL
+   16.4 or later, 17.4 or later, or 18.3 or later, and Region support varies.
+   Check the
+   [zero-ETL support matrix](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.Aurora_Fea_Regions_DB-eng.Feature.Zero-ETL.html).
 2. A same-Region Redshift target in every Region that can host the writer.
 3. Every member cluster authorized as an integration source on its local target.
 4. A custom cluster parameter group on every member:
@@ -107,15 +117,24 @@ for i in "${!regions[@]}"; do
       IntegrationKmsKeyArn="${integration_key_arns[$i]}" \
       IntegrationName=globaldb-analytics \
       DataFilter="include: salesdb.*.*" \
+      IntegrationLagThresholdSeconds=900 \
       NotificationEmail=dba-oncall@example.com
 done
 ```
 
+`CAPABILITY_IAM` is sufficient because the template lets CloudFormation name the
+IAM role. Use `CAPABILITY_NAMED_IAM` only if you add a custom `RoleName`.
+
 The function timeout is 300 seconds. RDS clients use a five-second connection
-timeout, a 20-second read timeout, and standard SDK retries. EventBridge retries
-target delivery up to four times for one hour. After Lambda accepts an event,
-Lambda asynchronous invocation retries a handler error twice within a maximum
-event age of one hour.
+timeout, a 20-second read timeout, and standard SDK retries. The template
+configures EventBridge to retry target delivery up to four times within one
+hour, and configures Lambda asynchronous invocation to retry a handler error
+twice within a maximum event age of one hour. These are template settings, not
+service defaults.
+
+`IntegrationLagThresholdSeconds` (default 900, minimum 60) sets the lag alarm
+threshold. Replace the example value with the threshold your rehearsal and
+workload require.
 
 ## Concurrency and idempotency
 
@@ -141,12 +160,33 @@ aws rds describe-integrations --region us-west-2 \
   --output table
 ```
 
-Wait for the integration to become `active`, then validate selected tables:
+In the former primary Region, the old integration can report `deleting` for a
+while. Check it by its recorded ARN rather than by counting integrations.
+
+Wait for the new integration to become `active`. Then create the destination
+database on the local Redshift target from the integration ID in the SNS
+notification. Superusers can also read it from `SVV_INTEGRATION`. Aurora
+PostgreSQL requires the source database name:
+
+```sql
+CREATE DATABASE salesdb_analytics_west_01
+FROM INTEGRATION '<integration-id>'
+DATABASE 'salesdb';
+```
+
+The principal needs superuser privileges or both `CREATEDB` and `CREATEUSER`.
+Then validate the selected tables:
 
 ```sql
 SELECT * FROM SVV_INTEGRATION;
 SELECT * FROM SVV_INTEGRATION_TABLE_STATE;
 ```
+
+Each transition creates a new integration ID, so use a new versioned database
+name each time (for example, `salesdb_analytics_east_02` after switching back).
+The automation never drops Redshift databases; retain old ones until your
+retention and rollback requirements allow deletion. A switchover and switch-back
+rehearsal performs two full reseeds of the selected data.
 
 ## Failure recovery
 
@@ -169,6 +209,22 @@ is `active` and the selected tables have completed synchronization:
   with the last successful replication timestamp and a stale-data warning.
 - Resume normal processing only after `SVV_INTEGRATION` and
   `SVV_INTEGRATION_TABLE_STATE` confirm readiness.
+- Keep the destination database name in client configuration or your routing
+  layer, because each recovery uses a new versioned database name.
+
+## Monitoring
+
+The template creates alarms for Lambda errors and a non-empty DLQ. Because every
+recreated integration has a new `IntegrationId`, the function itself calls
+`PutMetricAlarm` after each create, `noop`, or race path to point two stable
+alarms at the newest ID:
+
+- `<IntegrationName>-zero-etl-integration-lag` (`IntegrationLag`)
+- `<IntegrationName>-zero-etl-tables-failed`
+  (`IntegrationNumTablesFailedReplication`)
+
+Both use the `AWS/Redshift` namespace and treat missing data as not breaching.
+CloudFormation doesn't own these two alarms; delete them separately.
 
 There is no universal reseeding duration. It varies with selected data volume,
 table count, source activity, and target capacity. Measure from integration
@@ -179,17 +235,44 @@ accepted.
 
 ## IAM scope
 
-`SourceClusterArns` scopes integration creation to the configured global member
-clusters. Request tags constrain the service-generated integration resource,
-and resource tags constrain deletion. The policy retains two necessary
-wildcards:
+- `DescribeGlobalClusters` is scoped to the configured global-cluster ARN.
+- `DescribeDBClusters` and `CreateIntegration` are scoped to
+  `SourceClusterArns`.
+- `DescribeIntegrations`, `DeleteIntegration`, and tagging use the
+  `arn:aws:rds:*:<account>:integration:*` pattern because integration IDs are
+  service generated and cleanup spans member Regions. Request-tag and
+  resource-tag conditions limit creation and deletion to integrations owned by
+  this automation.
+- Redshift permissions are scoped to the local target ARN.
+- Only `cloudwatch:PutMetricAlarm` and the X-Ray write APIs use
+  `Resource: "*"`.
 
-- RDS `DescribeGlobalClusters`, `DescribeDBClusters`, and
-  `DescribeIntegrations` do not support resource-level permissions.
-- Integration ARNs use a Region wildcard because cleanup spans all global
-  member Regions; ownership-tag conditions limit deletion.
+## Cost considerations
 
-X-Ray write APIs also require `Resource: "*"`.
+This design needs a Redshift target in every Region that can become primary.
+Every recreated integration performs a full initial synchronization, which uses
+source I/O and target compute. Measure synchronization time and cost in a
+non-production rehearsal. See
+[Amazon Aurora pricing](https://aws.amazon.com/rds/aurora/pricing/),
+[Amazon Redshift pricing](https://aws.amazon.com/redshift/pricing/), and
+[Amazon CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/).
+
+## Aurora MySQL
+
+Apply a custom `aurora-mysql8.0` cluster parameter group to every member:
+
+```text
+aurora_enhanced_binlog=1
+binlog_backup=0
+binlog_format=ROW
+binlog_replication_globaldb=0
+binlog_row_image=full
+binlog_row_metadata=full
+```
+
+Also make sure `binlog_transaction_compression` isn't `ON` and
+`binlog_row_value_options` isn't `PARTIAL_JSON`. Aurora MySQL data filters use
+`database.table` patterns.
 
 ## Clean up
 
@@ -197,20 +280,27 @@ X-Ray write APIs also require `Resource: "*"`.
 for region in us-east-1 us-west-2; do
   aws cloudformation delete-stack --region "$region" \
     --stack-name zero-etl-globaldb-recovery
+  aws cloudwatch delete-alarms --region "$region" --alarm-names \
+    globaldb-analytics-zero-etl-integration-lag \
+    globaldb-analytics-zero-etl-tables-failed
 done
 ```
 
-The stacks don't own the Aurora clusters, Redshift targets, or zero-ETL
-integrations. Delete test integrations and pre-existing test resources
-separately.
+The stacks don't own the Aurora clusters, Redshift targets, zero-ETL
+integrations, or destination databases. Delete test integrations and retained
+destination databases separately, after your retention requirements allow it.
 
 ## Verify before committing
 
 ```bash
 python3 -m py_compile lambda/zero_etl_recovery.py
 python3 scripts/sync_lambda_into_template.py --check
+python3 -m json.tool iam/lambda-least-privilege-policy.json > /dev/null
 cfn-lint cloudformation/zero-etl-recovery.yaml
 python3 -m checkov.main -f cloudformation/zero-etl-recovery.yaml --compact
+```
+
+The same checks, except `cfn-lint`, run in CI on every push and pull request.
 ```
 
 ## Security

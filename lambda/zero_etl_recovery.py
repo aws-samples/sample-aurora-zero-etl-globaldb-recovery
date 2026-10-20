@@ -38,6 +38,7 @@ INTEGRATION_NAME     Name applied to the managed integration.
 DATA_FILTER          Optional data filter. Required for Aurora PostgreSQL.
 KMS_KEY_ID           Optional KMS key ARN in this function's Region.
 SNS_TOPIC_ARN        Optional topic for outcome notifications.
+LAG_THRESHOLD_SECONDS Maximum acceptable IntegrationLag before alarming.
 """
 
 import json
@@ -62,6 +63,7 @@ INTEGRATION_NAME = os.environ["INTEGRATION_NAME"]
 DATA_FILTER = os.environ.get("DATA_FILTER")
 KMS_KEY_ID = os.environ.get("KMS_KEY_ID")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+LAG_THRESHOLD_SECONDS = int(os.environ.get("LAG_THRESHOLD_SECONDS", "900"))
 THIS_REGION = os.environ["AWS_REGION"]
 
 MANAGED_BY_TAG = "ManagedBy"
@@ -79,6 +81,7 @@ _BOTO_CONFIG = Config(
 
 rds = boto3.client("rds", config=_BOTO_CONFIG)
 sns = boto3.client("sns", config=_BOTO_CONFIG) if SNS_TOPIC_ARN else None
+cloudwatch = boto3.client("cloudwatch", config=_BOTO_CONFIG)
 _regional_rds = {THIS_REGION: rds}
 
 
@@ -226,6 +229,56 @@ def _create_integration(source_arn):
     return rds.create_integration(**kwargs)
 
 
+def _integration_id(integration_arn):
+    """Return the integration UUID used by the CloudWatch metric dimension."""
+    return integration_arn.rsplit(":", 1)[-1]
+
+
+def _upsert_replication_alarms(integration_arn):
+    """Point stable alarm names at the newest integration ID."""
+    integration_id = _integration_id(integration_arn)
+    alarm_actions = [SNS_TOPIC_ARN] if SNS_TOPIC_ARN else []
+    common = {
+        "Namespace": "AWS/Redshift",
+        "Dimensions": [{"Name": "IntegrationId", "Value": integration_id}],
+        "Period": 60,
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": alarm_actions,
+        "OKActions": alarm_actions,
+    }
+    cloudwatch.put_metric_alarm(
+        AlarmName=f"{INTEGRATION_NAME}-zero-etl-integration-lag",
+        AlarmDescription=(
+            "Zero-ETL integration lag exceeded the configured threshold for "
+            f"integration {integration_id}."
+        ),
+        MetricName="IntegrationLag",
+        Statistic="Maximum",
+        EvaluationPeriods=3,
+        DatapointsToAlarm=3,
+        Threshold=LAG_THRESHOLD_SECONDS,
+        ComparisonOperator="GreaterThanThreshold",
+        Unit="Seconds",
+        **common,
+    )
+    cloudwatch.put_metric_alarm(
+        AlarmName=f"{INTEGRATION_NAME}-zero-etl-tables-failed",
+        AlarmDescription=(
+            "One or more tables failed zero-ETL replication for integration "
+            f"{integration_id}."
+        ),
+        MetricName="IntegrationNumTablesFailedReplication",
+        Statistic="Maximum",
+        EvaluationPeriods=1,
+        DatapointsToAlarm=1,
+        Threshold=0,
+        ComparisonOperator="GreaterThanThreshold",
+        Unit="Count",
+        **common,
+    )
+    logger.info("Updated replication alarms for integration %s.", integration_id)
+
+
 def _validate_regional_configuration(writer_arn):
     """Fail before cleanup if allowlist or local-target configuration is invalid."""
     if writer_arn not in SOURCE_CLUSTER_ARNS:
@@ -297,6 +350,7 @@ def handler(event, _context):
             existing["IntegrationArn"],
             existing["Status"],
         )
+        _upsert_replication_alarms(existing["IntegrationArn"])
         return {
             "status": "noop",
             "integrationArn": existing["IntegrationArn"],
@@ -319,6 +373,7 @@ def handler(event, _context):
                 "owned live integration was found for the current writer.",
             )
             raise
+        _upsert_replication_alarms(existing["IntegrationArn"])
         return {
             "status": "exists",
             "integrationArn": existing["IntegrationArn"],
@@ -355,10 +410,15 @@ def handler(event, _context):
         )
         raise
 
+    _upsert_replication_alarms(result["IntegrationArn"])
+
     summary = [
         f"Event {event_id} on global cluster {GLOBAL_CLUSTER_ID}.",
         f"Created integration {result['IntegrationArn']} against writer "
         f"{writer_arn} and local target {TARGET_ARN}.",
+        f"Integration ID: {_integration_id(result['IntegrationArn'])}.",
+        "After the integration reaches active, create a Redshift destination "
+        "database from this integration ID before expecting data replication.",
         "Initial data seeding must finish before freshness-sensitive queries resume.",
     ]
     if deleted:

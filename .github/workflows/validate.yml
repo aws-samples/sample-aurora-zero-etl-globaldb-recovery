@@ -1,0 +1,34 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile Lambda source
+        run: python -m py_compile lambda/zero_etl_recovery.py
+
+      - name: Check inline Lambda code matches source
+        run: python scripts/sync_lambda_into_template.py --check
+
+      - name: Validate IAM policy JSON
+        run: python -m json.tool iam/lambda-least-privilege-policy.json > /dev/null
+
+      - name: Install Checkov
+        run: pip install checkov==3.3.8
+
+      - name: Scan CloudFormation template
+        run: checkov -f cloudformation/zero-etl-recovery.yaml --compact

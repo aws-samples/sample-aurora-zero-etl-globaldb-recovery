@@ -1,20 +1,26 @@
 {
-  "Comment": [
-    "Reference copy of the execution role policy created by cloudformation/zero-etl-recovery.yaml.",
-    "Replace account, Region, cluster, namespace, global cluster, and KMS placeholders.",
-    "Describe actions and X-Ray writes require Resource '*'. Integration ARNs retain a Region wildcard because cleanup spans every member Region, but creation and deletion are constrained by source ARNs and ownership tags."
-  ],
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "DiscoverTopologyAndIntegrations",
+      "Sid": "DescribeConfiguredGlobalCluster",
       "Effect": "Allow",
-      "Action": [
-        "rds:DescribeGlobalClusters",
-        "rds:DescribeDBClusters",
-        "rds:DescribeIntegrations"
-      ],
-      "Resource": "*"
+      "Action": "rds:DescribeGlobalClusters",
+      "Resource": "arn:aws:rds::111122223333:global-cluster:aurora-postgres-global"
+    },
+    {
+      "Sid": "DescribeConfiguredMemberClusters",
+      "Effect": "Allow",
+      "Action": "rds:DescribeDBClusters",
+      "Resource": [
+        "arn:aws:rds:us-east-1:111122223333:cluster:aurora-postgres-primary",
+        "arn:aws:rds:us-west-2:111122223333:cluster:aurora-postgres-secondary"
+      ]
+    },
+    {
+      "Sid": "DescribeAccountIntegrations",
+      "Effect": "Allow",
+      "Action": "rds:DescribeIntegrations",
+      "Resource": "arn:aws:rds:*:111122223333:integration:*"
     },
     {
       "Sid": "CreateIntegrationForConfiguredSources",
@@ -97,6 +103,12 @@
       "Effect": "Allow",
       "Action": "sns:Publish",
       "Resource": "arn:aws:sns:us-east-1:111122223333:globaldb-analytics-zero-etl-recovery"
+    },
+    {
+      "Sid": "UpdateReplicationAlarms",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricAlarm",
+      "Resource": "*"
     },
     {
       "Sid": "SendToDeadLetterQueue",
