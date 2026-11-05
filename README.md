@@ -244,8 +244,12 @@ accepted.
   resource-tag conditions limit creation and deletion to integrations owned by
   this automation.
 - Redshift permissions are scoped to the local target ARN.
-- Only `cloudwatch:PutMetricAlarm` and the X-Ray write APIs use
-  `Resource: "*"`.
+- `cloudwatch:PutMetricAlarm` is scoped to the two replication alarm ARNs that
+  the function manages.
+- The SNS topic and KMS key policies allow only this stack's CloudWatch alarms
+  (`aws:SourceAccount` and `aws:SourceArn`) and this stack's EventBridge
+  dead-letter delivery (SQS encryption context) to use them.
+- Only the X-Ray write APIs use `Resource: "*"`.
 
 ## Cost considerations
 
@@ -301,7 +305,6 @@ python3 -m checkov.main -f cloudformation/zero-etl-recovery.yaml --compact
 ```
 
 The same checks, except `cfn-lint`, run in CI on every push and pull request.
-```
 
 ## Security
 

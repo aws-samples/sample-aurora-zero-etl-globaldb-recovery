@@ -98,16 +98,39 @@ Resources:
               AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
-          - Sid: AllowCloudWatchAndEventsToUseTopic
+          # Only this stack's CloudWatch alarms publish to the encrypted topic.
+          # The source conditions prevent another account's alarm from using
+          # the key (confused deputy). The name pattern covers the two template
+          # alarms and the two replication alarms the function creates.
+          - Sid: AllowStackAlarmsToUseTopicKey
             Effect: Allow
             Principal:
-              Service:
-                - cloudwatch.amazonaws.com
-                - events.amazonaws.com
+              Service: cloudwatch.amazonaws.com
             Action:
               - kms:Decrypt
               - kms:GenerateDataKey*
             Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${IntegrationName}-zero-etl-*'
+          # EventBridge sends failed deliveries to the KMS-encrypted dead-letter
+          # queue. AWS doesn't support aws:SourceArn or aws:SourceAccount in key
+          # policies for EventBridge, so the grant is limited by the SQS
+          # encryption context to this stack's queue. The queue policy separately
+          # limits SendMessage to this stack's rule.
+          - Sid: AllowEventBridgeDeadLetterDelivery
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:EncryptionContext:aws:sqs:arn': !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${IntegrationName}-zero-etl-recovery-dlq'
           # CloudWatch Logs is a service principal, so it must be granted in the
           # key policy directly. The log group ARN is built from the name pattern
           # rather than !GetAtt to avoid a circular dependency with the key.
@@ -138,7 +161,7 @@ Resources:
       TopicName: !Sub '${IntegrationName}-zero-etl-recovery'
       KmsMasterKeyId: !Ref NotificationKey
 
-  # Enforce TLS for every publish to the topic.
+  # Allow the account and this stack's alarms to publish; enforce TLS.
   NotificationTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Properties:
@@ -153,14 +176,17 @@ Resources:
               AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: 'sns:Publish'
             Resource: !Ref NotificationTopic
-          - Sid: AllowServicePublish
+          - Sid: AllowStackAlarmsPublish
             Effect: Allow
             Principal:
-              Service:
-                - cloudwatch.amazonaws.com
-                - events.amazonaws.com
+              Service: cloudwatch.amazonaws.com
             Action: 'sns:Publish'
             Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${IntegrationName}-zero-etl-*'
           - Sid: DenyInsecureTransport
             Effect: Deny
             Principal: '*'
@@ -323,13 +349,14 @@ Resources:
                 Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref NotificationTopic
-              # PutMetricAlarm doesn't support resource-level permissions. The
-              # function uses stable names prefixed by IntegrationName and only
-              # updates the two zero-ETL replication alarms it owns.
+              # The function creates or updates only these two stable alarm
+              # names, so PutMetricAlarm is scoped to their alarm ARNs.
               - Sid: UpdateReplicationAlarms
                 Effect: Allow
                 Action: cloudwatch:PutMetricAlarm
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${IntegrationName}-zero-etl-integration-lag'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${IntegrationName}-zero-etl-tables-failed'
               - Sid: UseNotificationKeyViaMessaging
                 Effect: Allow
                 Action:

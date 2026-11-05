@@ -108,7 +108,10 @@
       "Sid": "UpdateReplicationAlarms",
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricAlarm",
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:cloudwatch:us-east-1:111122223333:alarm:globaldb-analytics-zero-etl-integration-lag",
+        "arn:aws:cloudwatch:us-east-1:111122223333:alarm:globaldb-analytics-zero-etl-tables-failed"
+      ]
     },
     {
       "Sid": "SendToDeadLetterQueue",
